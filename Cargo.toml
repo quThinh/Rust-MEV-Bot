@@ -23,9 +23,9 @@ tokio-tungstenite = "*"
 async-trait = "0.1.74"
 
 ethers-core = "2.0"
-ethers-providers = "2.0"
+ethers-providers = "2.0.14"
 ethers-contract = "2.0"
-ethers = { version = "2.0", features = ["abigen", "ws", "ipc"] }
+ethers = { version = "2.0", features = ["abigen", "ws", "ipc", "openssl"] }
 
 ethers-flashbots = { git = "https://github.com/onbjerg/ethers-flashbots" }
 

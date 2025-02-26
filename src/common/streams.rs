@@ -37,8 +37,7 @@ pub enum Event {
 }
 
 // A websocket connection made to get newly created blocks
-pub async fn stream_new_blocks(provider: Provider<Ws>, event_sender: Sender<Event>) {
-    info!("Subscribing to new block = s");
+pub async fn stream_new_blocks(provider: Arc<Provider<Ws>>, event_sender: Sender<Event>) {
     let stream = match provider.subscribe_blocks().await {
         Ok(subscription) => {
             subscription
@@ -69,7 +68,7 @@ pub async fn stream_new_blocks(provider: Provider<Ws>, event_sender: Sender<Even
 }
 
 // A websocket connection made to get new pending transactions
-pub async fn stream_pending_transactions(provider: Provider<Ws>, event_sender: Sender<Event>) {
+pub async fn stream_pending_transactions(provider: Arc<Provider<Ws>>, event_sender: Sender<Event>) {
     let stream = provider.subscribe_pending_txs().await.unwrap();
     let mut stream = stream.transactions_unordered(256).fuse();
 
