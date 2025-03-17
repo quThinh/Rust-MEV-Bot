@@ -25,6 +25,11 @@ pub enum SwapDirection {
     Sell,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct BatchSandwich {
+    pub sandwiches: Vec<Sandwich>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SwapInfo {
     pub tx_hash: H256,
@@ -199,4 +204,398 @@ pub async fn extract_swap_info(
     }
 
     Ok(swap_info_vec)
+}
+
+impl BatchSandwich {
+    pub fn bundle_id(&self) -> String {
+        let mut tx_hashes = Vec::new();
+        for sandwich in &self.sandwiches {
+            let tx_hash = sandwich.victim_tx.tx_hash;
+            let tx_hash_4_bytes = &format!("{:?}", tx_hash)[0..10];
+            tx_hashes.push(String::from_str(tx_hash_4_bytes).unwrap());
+        }
+        tx_hashes.sort();
+        tx_hashes.dedup();
+        tx_hashes.join("-")
+    }
+
+    pub fn victim_tx_hashes(&self) -> Vec<H256> {
+        self.sandwiches
+            .iter()
+            .map(|s| s.victim_tx.tx_hash)
+            .collect()
+    }
+
+    pub fn target_tokens(&self) -> Vec<H160> {
+        self.sandwiches
+            .iter()
+            .map(|s| s.swap_info.target_token)
+            .collect()
+    }
+
+    pub fn target_v2_pairs(&self) -> Vec<H160> {
+        self.sandwiches
+            .iter()
+            .filter(|s| s.swap_info.version == 2)
+            .map(|s| s.swap_info.target_pair)
+            .collect()
+    }
+
+    pub fn encode_frontrun_tx(
+        &self,
+        block_number: U256,
+        pair_reserves: &HashMap<H160, (U256, U256)>,
+    ) -> Result<(Bytes, Vec<Tx>, HashMap<H160, U256>)> {
+        let mut starting_mc_values = HashMap::new();
+
+        let mut added_tx_hash = HashMap::new();
+        let mut victim_txs = Vec::new();
+
+        let mut frontrun_swap_params = Vec::new();
+
+        let block_number_u256 = eU256::from_dec_str(&block_number.to_string())?;
+        frontrun_swap_params.push(
+            SolidityDataType::NumberWithShift(block_number_u256, TakeLastXBytes(64)), // blockNumber (uint64)
+        );
+
+        for sandwich in &self.sandwiches {
+            let tx_hash = sandwich.victim_tx.tx_hash;
+            if !added_tx_hash.contains_key(&tx_hash) {
+                added_tx_hash.insert(tx_hash, true);
+                victim_txs.push(Tx::from(sandwich.victim_tx.clone()));
+            }
+
+            // Token swap 0 -> 1
+            // Frontrun tx is a main_currency -> target_token BUY tx
+            // thus, if token0_is_main, then it is zero_for_one swap
+            let zero_for_one = sandwich.swap_info.token0_is_main;
+
+            let new_amount_in = sandwich
+                .amount_in
+                .checked_sub(U256::from(1))
+                .unwrap_or(U256::zero());
+            let amount_in_u256 = eU256::from_dec_str(&new_amount_in.to_string())?;
+            let amount_out_u256 = if sandwich.swap_info.version == 2 {
+                let reserves = pair_reserves.get(&sandwich.swap_info.target_pair).unwrap();
+                let (reserve_in, reserve_out) = if zero_for_one {
+                    (reserves.0, reserves.1)
+                } else {
+                    (reserves.1, reserves.0)
+                };
+                let amount_out = get_v2_amount_out(new_amount_in, reserve_in, reserve_out);
+                eU256::from_dec_str(&amount_out.to_string())?
+            } else {
+                eU256::zero()
+            };
+
+            let pair = eH160::from_str(&format!("{:?}", sandwich.swap_info.target_pair)).unwrap();
+            let token_in =
+                eH160::from_str(&format!("{:?}", sandwich.swap_info.main_currency)).unwrap();
+
+            let main_currency = sandwich.swap_info.main_currency;
+            if starting_mc_values.contains_key(&main_currency) {
+                let prev_mc_value = *starting_mc_values.get(&main_currency).unwrap();
+                starting_mc_values.insert(main_currency, prev_mc_value + new_amount_in);
+            } else {
+                starting_mc_values.insert(main_currency, new_amount_in);
+            }
+
+            frontrun_swap_params.extend(vec![
+                SolidityDataType::NumberWithShift(
+                    eU256::from(zero_for_one as u8),
+                    TakeLastXBytes(8),
+                ), // zeroForOne (uint8)
+                SolidityDataType::Address(pair),     // pair (address)
+                SolidityDataType::Address(token_in), // tokenIn (address)
+                SolidityDataType::NumberWithShift(amount_in_u256, TakeLastXBytes(256)), // amountIn (uint256)
+                SolidityDataType::NumberWithShift(amount_out_u256, TakeLastXBytes(256)), // amountOut (uint256)
+            ]);
+        }
+
+        let frontrun_calldata = eth_encode_packed::abi::encode_packed(&frontrun_swap_params);
+        let frontrun_calldata_bytes = Bytes::from_str(&frontrun_calldata.1).unwrap_or_default();
+
+        Ok((frontrun_calldata_bytes, victim_txs, starting_mc_values))
+    }
+
+    pub fn encode_backrun_tx(
+        &self,
+        block_number: U256,
+        pair_reserves: &HashMap<H160, (U256, U256)>,
+        token_balances: &HashMap<H160, U256>,
+    ) -> Result<Bytes> {
+        let mut backrun_swap_params = Vec::new();
+
+        let block_number_u256 = eU256::from_dec_str(&block_number.to_string())?;
+        backrun_swap_params.push(
+            SolidityDataType::NumberWithShift(block_number_u256, TakeLastXBytes(64)), // blockNumber (uint64)
+        );
+
+        for sandwich in &self.sandwiches {
+            let amount_in = *token_balances
+                .get(&sandwich.swap_info.target_token)
+                .unwrap_or(&U256::zero());
+            let new_amount_in = amount_in.checked_sub(U256::from(1)).unwrap_or(U256::zero());
+            let amount_in_u256 = eU256::from_dec_str(&new_amount_in.to_string())?;
+
+            // this means that the buy order is token0 -> token1
+            let zero_for_one = sandwich.swap_info.token0_is_main;
+
+            // in backrun tx we sell tokens we bought in our frontrun tx
+            // so it's important to flip the boolean value of zero_for_one
+            let amount_out_u256 = if sandwich.swap_info.version == 2 {
+                let reserves = pair_reserves.get(&sandwich.swap_info.target_pair).unwrap();
+                let (reserve_in, reserve_out) = if zero_for_one {
+                    // token0 is main_currency
+                    (reserves.1, reserves.0)
+                } else {
+                    // token1 is main_currency
+                    (reserves.0, reserves.1)
+                };
+                let amount_out = get_v2_amount_out(new_amount_in, reserve_in, reserve_out);
+                eU256::from_dec_str(&amount_out.to_string())?
+            } else {
+                eU256::zero()
+            };
+
+            let pair = eH160::from_str(&format!("{:?}", sandwich.swap_info.target_pair)).unwrap();
+            let token_in =
+                eH160::from_str(&format!("{:?}", sandwich.swap_info.target_token)).unwrap();
+
+            backrun_swap_params.extend(vec![
+                SolidityDataType::NumberWithShift(
+                    eU256::from(!zero_for_one as u8), // <-- make sure to flip boolean value (it's a sell now, not buy)
+                    TakeLastXBytes(8),
+                ), // zeroForOne (uint8)
+                SolidityDataType::Address(pair),     // pair (address)
+                SolidityDataType::Address(token_in), // tokenIn (address)
+                SolidityDataType::NumberWithShift(amount_in_u256, TakeLastXBytes(256)), // amountIn (uint256)
+                SolidityDataType::NumberWithShift(amount_out_u256, TakeLastXBytes(256)), // amountOut (uint256)
+            ]);
+        }
+
+        let backrun_calldata = eth_encode_packed::abi::encode_packed(&backrun_swap_params);
+        let backrun_calldata_bytes = Bytes::from_str(&backrun_calldata.1).unwrap_or_default();
+
+        Ok(backrun_calldata_bytes)
+    }
+
+    pub async fn simulate(
+        &self,
+        provider: Arc<Provider<Ws>>,
+        owner: Option<H160>,
+        block_number: U64,
+        base_fee: U256,
+        max_fee: U256,
+        front_access_list: Option<AccessList>,
+        back_access_list: Option<AccessList>,
+        bot_address: Option<H160>,
+    ) -> Result<SimulatedSandwich> {
+        let mut simulator = EvmSimulator::new(provider.clone(), owner, block_number);
+
+        // set ETH balance so that it's enough to cover gas fees
+        match owner {
+            None => {
+                let initial_eth_balance = U256::from(100) * U256::from(10).pow(U256::from(18));
+                simulator.set_eth_balance(simulator.owner, initial_eth_balance);
+            }
+            _ => {}
+        }
+
+        // get reserves for v2 pairs and target tokens
+        let target_v2_pairs = self.target_v2_pairs();
+        let target_tokens = self.target_tokens();
+
+        let mut reserves_before = HashMap::new();
+
+        for v2_pair in &target_v2_pairs {
+            let reserves = simulator.get_pair_reserves(*v2_pair)?;
+            reserves_before.insert(*v2_pair, reserves);
+        }
+
+        let next_block_number = simulator.get_block_number();
+
+        // create frontrun tx calldata and inject main_currency token balance to bot contract
+        let (frontrun_calldata, victim_txs, starting_mc_values) =
+            self.encode_frontrun_tx(next_block_number, &reserves_before)?;
+
+        // deploy Sandooo bot
+        let bot_address = match bot_address {
+            Some(bot_address) => bot_address,
+            None => {
+                let bot_address = create_new_wallet().1;
+                simulator.deploy(bot_address, Bytecode::new_raw((*SANDOOO_BYTECODE.0).into()));
+
+                // override owner slot
+                let owner_ru256 = rU256::from_str(&format!("{:?}", simulator.owner)).unwrap();
+                simulator.insert_account_storage(bot_address, rU256::from(0), owner_ru256)?;
+
+                for (main_currency, starting_value) in &starting_mc_values {
+                    let mc = MainCurrency::new(*main_currency);
+                    let balance_slot = mc.balance_slot();
+                    simulator.set_token_balance(
+                        *main_currency,
+                        bot_address,
+                        balance_slot,
+                        (*starting_value).into(),
+                    )?;
+                }
+
+                bot_address
+            }
+        };
+
+        // check ETH, MC balance before any txs are run
+        let eth_balance_before = simulator.get_eth_balance_of(simulator.owner);
+        let mut mc_balances_before = HashMap::new();
+        for (main_currency, _) in &starting_mc_values {
+            let balance_before = simulator.get_token_balance(*main_currency, bot_address)?;
+            mc_balances_before.insert(main_currency, balance_before);
+        }
+
+        // set base fee so that gas fees are taken into account
+        simulator.set_base_fee(base_fee);
+
+        // Frontrun
+        let front_tx = Tx {
+            caller: simulator.owner,
+            transact_to: bot_address,
+            data: frontrun_calldata.0.clone(),
+            value: U256::zero(),
+            gas_price: base_fee,
+            gas_limit: 5000000,
+        };
+        let front_access_list = match front_access_list {
+            Some(access_list) => access_list,
+            None => match simulator.get_access_list(front_tx.clone()) {
+                Ok(access_list) => access_list,
+                _ => AccessList::default(),
+            },
+        };
+        simulator.set_access_list(front_access_list.clone());
+        let front_gas_used = match simulator.call(front_tx) {
+            Ok(result) => result.gas_used,
+            Err(_) => 0,
+        };
+
+        // Victim Txs
+        for victim_tx in victim_txs {
+            match simulator.call(victim_tx) {
+                _ => {}
+            }
+        }
+
+        simulator.set_base_fee(U256::zero());
+
+        // get reserves after frontrun / victim tx
+        let mut reserves_after = HashMap::new();
+        let mut token_balances = HashMap::new();
+
+        for v2_pair in &target_v2_pairs {
+            let reserves = simulator
+                .get_pair_reserves(*v2_pair)
+                .unwrap_or((U256::zero(), U256::zero()));
+            reserves_after.insert(*v2_pair, reserves);
+        }
+
+        for token in &target_tokens {
+            let token_balance = simulator
+                .get_token_balance(*token, bot_address)
+                .unwrap_or_default();
+            token_balances.insert(*token, token_balance);
+        }
+
+        simulator.set_base_fee(base_fee);
+
+        let backrun_calldata =
+            self.encode_backrun_tx(next_block_number, &reserves_after, &token_balances)?;
+
+        // Backrun
+        let back_tx = Tx {
+            caller: simulator.owner,
+            transact_to: bot_address,
+            data: backrun_calldata.0.clone(),
+            value: U256::zero(),
+            gas_price: max_fee,
+            gas_limit: 5000000,
+        };
+        let back_access_list = match back_access_list.clone() {
+            Some(access_list) => access_list,
+            None => match simulator.get_access_list(back_tx.clone()) {
+                Ok(access_list) => access_list,
+                _ => AccessList::default(),
+            },
+        };
+        let back_access_list = back_access_list.clone();
+        simulator.set_access_list(back_access_list.clone());
+        let back_gas_used = match simulator.call(back_tx) {
+            Ok(result) => result.gas_used,
+            Err(_) => 0,
+        };
+
+        simulator.set_base_fee(U256::zero());
+
+        let eth_balance_after = simulator.get_eth_balance_of(simulator.owner);
+        let mut mc_balances_after = HashMap::new();
+        for (main_currency, _) in &starting_mc_values {
+            let balance_after = simulator.get_token_balance(*main_currency, bot_address)?;
+            mc_balances_after.insert(main_currency, balance_after);
+        }
+
+        let eth_used_as_gas = eth_balance_before
+            .checked_sub(eth_balance_after)
+            .unwrap_or(eth_balance_before);
+        let eth_used_as_gas_i256 = I256::from_dec_str(&eth_used_as_gas.to_string())?;
+
+        let usdt = H160::from_str(USDT).unwrap();
+        let usdc = H160::from_str(USDC).unwrap();
+
+        let mut weth_before_i256 = I256::zero();
+        let mut weth_after_i256 = I256::zero();
+
+        for (main_currency, _) in &starting_mc_values {
+            let mc_balance_before = *mc_balances_before.get(&main_currency).unwrap();
+            let mc_balance_after = *mc_balances_after.get(&main_currency).unwrap();
+
+            let (mc_balance_before, mc_balance_after) = if *main_currency == usdt {
+                let before =
+                    convert_usdt_to_weth(&mut simulator, mc_balance_before).unwrap_or_default();
+                let after =
+                    convert_usdt_to_weth(&mut simulator, mc_balance_after).unwrap_or_default();
+                (before, after)
+            } else if *main_currency == usdc {
+                let before =
+                    convert_usdc_to_weth(&mut simulator, mc_balance_before).unwrap_or_default();
+                let after =
+                    convert_usdc_to_weth(&mut simulator, mc_balance_after).unwrap_or_default();
+                (before, after)
+            } else {
+                (mc_balance_before, mc_balance_after)
+            };
+
+            let mc_balance_before_i256 = I256::from_dec_str(&mc_balance_before.to_string())?;
+            let mc_balance_after_i256 = I256::from_dec_str(&mc_balance_after.to_string())?;
+
+            weth_before_i256 += mc_balance_before_i256;
+            weth_after_i256 += mc_balance_after_i256;
+        }
+
+        let profit = (weth_after_i256 - weth_before_i256).as_i128();
+        let gas_cost = eth_used_as_gas_i256.as_i128();
+        let revenue = profit - gas_cost;
+
+        let simulated_sandwich = SimulatedSandwich {
+            revenue,
+            profit,
+            gas_cost,
+            front_gas_used,
+            back_gas_used,
+            front_access_list,
+            back_access_list,
+            front_calldata: frontrun_calldata,
+            back_calldata: backrun_calldata,
+        };
+
+        Ok(simulated_sandwich)
+    }
 }
